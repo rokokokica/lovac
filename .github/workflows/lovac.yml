@@ -239,6 +239,8 @@ jobs:
               broj_poslovnica: int
               sidrena: Decimal | None
               najniza_30: Decimal | None
+              redovna: Decimal | None = None
+              akcijska: Decimal | None = None
 
 
           def prikupi(lanac: str, datum: dt.date, grad: str) -> list:
@@ -281,6 +283,8 @@ jobs:
                       broj_poslovnica=len(unosi),
                       sidrena=p.anchor_price,
                       najniza_30=p.best_price_30,
+                      redovna=p.price,
+                      akcijska=p.special_price,
                   )
               return rezultat
 
@@ -475,6 +479,21 @@ jobs:
                   print(f"Telegram: nije poslano ({err})")
 
 
+          def dijagnostika(nalazi: list[Nalaz]) -> None:
+              """Ispis u zapisnik: koliko nalaza daje koji signal, i najveći primjeri."""
+              from collections import Counter
+              brojac = Counter()
+              for n in nalazi:
+                  for dio in n.razlog.split(" · "):
+                      brojac[dio.split(":")[0]] += 1
+              print("    signali:", dict(brojac))
+              for n in sorted(nalazi, key=lambda n: -n.pad)[:12]:
+                  a = n.artikl
+                  print(f"    DIAG −{n.pad:.0f}% | {a.naziv[:40]} | {a.kolicina} | sada {a.najniza} | "
+                        f"medijan {a.medijan} ({a.broj_poslovnica} posl.) | sidrena {a.sidrena} | "
+                        f"30d {a.najniza_30} | MPC {a.redovna} akc {a.akcijska} | {n.razlog[:80]}")
+
+
           # --------------------------------------------------------------------------
           # Glavni program
           # --------------------------------------------------------------------------
@@ -517,6 +536,7 @@ jobs:
                   svi_nalazi += nalazi
                   statusi[lanac] = f"{len(poslovnice)} poslovnica, {len(artikli)} artikala"
                   print(f"  ✓ {len(poslovnice)} poslovnica, {len(artikli)} artikala, {len(nalazi)} sumnjivih")
+                  dijagnostika(nalazi)
 
               putanja = napravi_izvjestaj(db, svi_nalazi, datum, statusi, args.prag, rijeci)
               print(f"\nIzvještaj: {putanja}")
