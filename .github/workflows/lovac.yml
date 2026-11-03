@@ -132,9 +132,9 @@ jobs:
               return float((stara - nova) / stara * 100) if stara else 0.0
 
 
-          def karta(poslovnica: str) -> str:
-              """Link koji otvara poslovnicu u Google Kartama."""
-              return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(poslovnica)
+          def link_artikla(lanac: str, naziv: str) -> str:
+              """Pretraga artikla. Kaufland i Plodine nemaju stranicu za svaki artikl, pa vodi na pretragu."""
+              return "https://www.google.com/search?q=" + urllib.parse.quote(f"{lanac} {naziv}")
 
 
           def odgovara_filtru(tekst: str, rijeci: list[str]) -> bool:
@@ -388,8 +388,8 @@ jobs:
               redovi = "\n".join(
                   f"""<tr>
                     <td class="pad">−{n.pad:.0f}%</td>
-                    <td><b>{e(n.artikl.naziv)}</b><br><span class="sitno">{e(n.artikl.marka)} {e(n.artikl.kolicina)}</span></td>
-                    <td>{e(n.lanac.title())}<br><a class="sitno" href="{e(karta(n.artikl.poslovnica))}" target="_blank" rel="noopener">{e(n.artikl.poslovnica)} ↗</a></td>
+                    <td><a class="artikl" href="{e(link_artikla(n.lanac, n.artikl.naziv))}" target="_blank" rel="noopener"><b>{e(n.artikl.naziv)}</b> ↗</a><br><span class="sitno">{e(n.artikl.marka)} {e(n.artikl.kolicina)}</span></td>
+                    <td>{e(n.lanac.title())}<br><span class="sitno">{e(n.artikl.poslovnica)}</span></td>
                     <td class="cijena">{n.artikl.najniza:.2f} €<br><span class="stara">{n.usporedna:.2f} €</span></td>
                     <td>{graf(povijest_artikla(db, datum, n.lanac, n.sifra), float(n.usporedna))}</td>
                     <td class="sitno">{e(n.razlog)}</td>
@@ -400,8 +400,8 @@ jobs:
               ras_redovi = "\n".join(
                   f"""<tr>
                     <td class="pad mali">−{n.pad:.0f}%</td>
-                    <td><b>{e(n.artikl.naziv)}</b><br><span class="sitno">{e(n.artikl.marka)} {e(n.artikl.kolicina)}</span></td>
-                    <td>{e(n.lanac.title())}<br><a class="sitno" href="{e(karta(n.artikl.poslovnica))}" target="_blank" rel="noopener">{e(n.artikl.poslovnica)} ↗</a></td>
+                    <td><a class="artikl" href="{e(link_artikla(n.lanac, n.artikl.naziv))}" target="_blank" rel="noopener"><b>{e(n.artikl.naziv)}</b> ↗</a><br><span class="sitno">{e(n.artikl.marka)} {e(n.artikl.kolicina)}</span></td>
+                    <td>{e(n.lanac.title())}<br><span class="sitno">{e(n.artikl.poslovnica)}</span></td>
                     <td class="cijena">{n.artikl.najniza:.2f} €<br><span class="stara">{n.usporedna:.2f} €</span></td>
                   </tr>"""
                   for n in rasprodaje[:MAX_RASPRODAJA]
@@ -421,8 +421,8 @@ jobs:
                   f"""<tr>
                     <td class="sitno">{dt.date.fromisoformat(d):%d. %m.}</td>
                     <td class="pad mali">−{pad:.0f}%</td>
-                    <td><b>{e(naz)}</b><br><span class="sitno">{e(mar)} {e(kol)}</span></td>
-                    <td>{e(lan.title())}<br><a class="sitno" href="{e(karta(posl))}" target="_blank" rel="noopener">{e(posl)} ↗</a></td>
+                    <td><a class="artikl" href="{e(link_artikla(lan, naz))}" target="_blank" rel="noopener"><b>{e(naz)}</b> ↗</a><br><span class="sitno">{e(mar)} {e(kol)}</span></td>
+                    <td>{e(lan.title())}<br><span class="sitno">{e(posl)}</span></td>
                     <td class="cijena">{c:.2f} €<br><span class="stara">{u:.2f} €</span></td>
                   </tr>"""
                   for d, lan, naz, mar, kol, posl, c, u, pad in stari
@@ -467,7 +467,7 @@ jobs:
             .sitno {{ color:var(--mut); font-size:13px; }}
             .prazno {{ padding:24px 0; color:var(--mut); }}
             .wrap {{ overflow-x:auto; }}
-            a.sitno {{ color:var(--mut); text-decoration:underline; text-underline-offset:2px; }}
+            a.artikl {{ color:var(--tx); text-decoration:underline; text-decoration-color:var(--line); text-underline-offset:3px; }}
             .graf {{ display:block; }}
             details {{ margin-top:36px; }}
             summary {{ cursor:pointer; color:var(--mut); }}
@@ -502,7 +502,8 @@ jobs:
                   redovi.append(
                       f"\n−{n.pad:.0f}%  {n.artikl.naziv} {n.artikl.kolicina}".rstrip()
                       + f"\n{n.artikl.najniza:.2f} € (inače {n.usporedna:.2f} €)"
-                      + f"\n{n.artikl.poslovnica}: {karta(n.artikl.poslovnica)}"
+                      + f"\n{n.artikl.poslovnica}"
+                      + f"\n{link_artikla(n.lanac, n.artikl.naziv)}"
                   )
               url_stranice = os.environ.get("STRANICA_URL", "").strip()
               if url_stranice:
