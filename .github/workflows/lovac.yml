@@ -10,6 +10,14 @@ permissions:
   pages: write
   id-token: write
 
+# ===== POSTAVKE: ovo slobodno mijenjaj =====
+env:
+  LANCI: "kaufland,plodine"   # npr. "kaufland,plodine,konzum,spar,lidl"
+  GRAD: "Zagreb"              # "" za cijelu Hrvatsku
+  PRAG: "50"                  # postotak pada koji je sumnjiv
+  SAMO: ""                    # npr. "kava,meso,protein"; prazno = sve
+# ===========================================
+
 concurrency:
   group: lovac
   cancel-in-progress: false
@@ -39,6 +47,9 @@ jobs:
         working-directory: crawler-projekt
         env:
           PYTHONUTF8: "1"
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          STRANICA_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
         run: |
           cat > lovac.py <<'LOVAC_EOF'
           """
@@ -47,25 +58,23 @@ jobs:
 
           Skida službene dnevne cjenike trgovačkih lanaca (obveza po NN 75/2025 i
           NN 101/2026), sprema ih u lokalnu bazu i traži sumnjivo niske cijene.
+          Koristi crawlere iz otvorenog projekta cijene-api (github.com/senko/cijene-api).
 
-          Koristi crawlere iz otvorenog projekta cijene-api (github.com/senko/cijene-api),
-          pa ova datoteka mora stajati u mapi tog projekta.
+          Opcije:
+              -c / --lanci   kaufland,plodine,konzum,spar,lidl ...
+              --grad         Zagreb (zadano), Split ..., "" za cijelu Hrvatsku
+              --prag         postotak pada koji je sumnjiv (zadano 50)
+              --samo         samo artikli koji sadrže neku od riječi, npr. "kava,meso,protein"
 
-          Pokretanje (iz mape cijene-api):
-              uv run lovac.py                 # Kaufland + Plodine, poslovnice u Zagrebu
-              uv run lovac.py -c kaufland,plodine,konzum,spar
-              uv run lovac.py --grad ""       # sve poslovnice u Hrvatskoj (sporije)
-              uv run lovac.py --prag 40       # strože: samo padovi od 40% i više
+          Telegram obavijest (nije obavezno): postavi varijable okruženja
+          TELEGRAM_TOKEN i TELEGRAM_CHAT. Ako je postavljen STRANICA_URL, poruka
+          sadrži i link na izvještaj.
 
-          Na kraju se u pregledniku otvori izvještaj (izvjestaj.html).
-
-          Što se smatra sumnjivim (svaki signal ima svoj razlog u izvještaju):
-            1. POSLOVNICA  - u jednoj poslovnici cijena je drastično niža nego u ostalima
-                             istog lanca isti dan (klasična greška pri unosu)
-            2. POVIJEST    - cijena je pala jako ispod uobičajene (medijan zadnjih dana);
-                             radi od drugog pokretanja, jer treba povijest
-            3. SIDRENA     - cijena je drastično niža od sidrene cijene (2. 5. 2025.)
-            4. 30 DANA     - cijena je drastično niža od najniže cijene u zadnjih 30 dana
+          Signali sumnjive cijene:
+            POSLOVNICA - u jednoj poslovnici drastično niža nego u ostalima istog lanca
+            POVIJEST   - drastično ispod uobičajene cijene (radi od drugog dana)
+            SIDRENA    - drastično ispod sidrene cijene (2. 5. 2025.)
+            30 DANA    - drastično ispod najniže cijene u zadnjih 30 dana
           """
 
           from __future__ import annotations
@@ -73,11 +82,15 @@ jobs:
           import argparse
           import datetime as dt
           import html
+          import json
           import logging
+          import os
           import sqlite3
           import statistics
           import sys
           import unicodedata
+          import urllib.parse
+          import urllib.request
           import webbrowser
           from dataclasses import dataclass
           from decimal import Decimal
@@ -87,11 +100,12 @@ jobs:
           BAZA = MAPA / "lovac_cijene.sqlite"
           IZVJESTAJ = MAPA / "izvjestaj.html"
 
-          ZADANI_LANCI = ["kaufland", "plodine"]
+          ZADANI_LANCI = "kaufland,plodine"
           ZADANI_GRAD = "Zagreb"
-          ZADANI_PRAG = 50  # postotak pada koji se smatra sumnjivim
-          MIN_CIJENA = Decimal("1.00")  # ispod ovoga ne gledamo (žvake, vrećice...)
+          ZADANI_PRAG = 50
+          MIN_CIJENA = Decimal("1.00")  # ispod ovoga ne gledamo
           DANI_POVIJESTI = 30
+          DANI_NALAZA = 7  # koliko dana unatrag prikazati stare nalaze
 
           log = logging.getLogger("lovac")
 
@@ -117,6 +131,13 @@ jobs:
               return float((stara - nova) / stara * 100) if stara else 0.0
 
 
+          def odgovara_filtru(tekst: str, rijeci: list[str]) -> bool:
+              if not rijeci:
+                  return True
+              t = bez_kvacica(tekst)
+              return any(r in t for r in rijeci)
+
+
           # --------------------------------------------------------------------------
           # Baza
           # --------------------------------------------------------------------------
@@ -132,6 +153,16 @@ jobs:
                   )
                   """
               )
+              db.execute(
+                  """
+                  CREATE TABLE IF NOT EXISTS nalazi (
+                      datum TEXT, lanac TEXT, sifra TEXT, naziv TEXT, marka TEXT,
+                      kolicina TEXT, poslovnica TEXT, cijena REAL, usporedna REAL,
+                      pad REAL, razlog TEXT,
+                      PRIMARY KEY (datum, lanac, sifra)
+                  )
+                  """
+              )
               return db
 
 
@@ -139,21 +170,33 @@ jobs:
               db.executemany(
                   "INSERT OR REPLACE INTO cijene VALUES (?,?,?,?,?,?,?,?)",
                   [
-                      (
-                          datum.isoformat(), lanac, sifra, a.naziv, a.marka, a.kolicina,
-                          float(a.najniza), float(a.medijan),
-                      )
+                      (datum.isoformat(), lanac, sifra, a.naziv, a.marka, a.kolicina,
+                       float(a.najniza), float(a.medijan))
                       for sifra, a in artikli.items()
                   ],
               )
-              # Čuvamo samo koliko treba za usporedbu, da baza ne raste unedogled
               granica = (datum - dt.timedelta(days=DANI_POVIJESTI + 5)).isoformat()
               db.execute("DELETE FROM cijene WHERE datum < ?", (granica,))
               db.commit()
 
 
+          def spremi_nalaze(db, datum: dt.date, lanac: str, nalazi: list) -> None:
+              db.execute("DELETE FROM nalazi WHERE datum=? AND lanac=?", (datum.isoformat(), lanac))
+              db.executemany(
+                  "INSERT OR REPLACE INTO nalazi VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  [
+                      (datum.isoformat(), n.lanac, n.sifra, n.artikl.naziv, n.artikl.marka,
+                       n.artikl.kolicina, n.artikl.poslovnica, float(n.artikl.najniza),
+                       float(n.usporedna), n.pad, n.razlog)
+                      for n in nalazi
+                  ],
+              )
+              granica = (datum - dt.timedelta(days=DANI_POVIJESTI + 5)).isoformat()
+              db.execute("DELETE FROM nalazi WHERE datum < ?", (granica,))
+              db.commit()
+
+
           def uobicajena_cijena(db, datum: dt.date, lanac: str, sifra: str) -> float | None:
-              """Medijan dnevnih medijana prije današnjeg dana."""
               od = (datum - dt.timedelta(days=DANI_POVIJESTI)).isoformat()
               redovi = db.execute(
                   "SELECT medijan_lanca FROM cijene WHERE lanac=? AND sifra=? AND datum>=? AND datum<?",
@@ -161,6 +204,23 @@ jobs:
               ).fetchall()
               vrijednosti = [r[0] for r in redovi if r[0]]
               return statistics.median(vrijednosti) if vrijednosti else None
+
+
+          def povijest_artikla(db, datum: dt.date, lanac: str, sifra: str) -> list[tuple[str, float]]:
+              od = (datum - dt.timedelta(days=DANI_POVIJESTI)).isoformat()
+              return db.execute(
+                  "SELECT datum, cijena FROM cijene WHERE lanac=? AND sifra=? AND datum>=? AND datum<=? ORDER BY datum",
+                  (lanac, sifra, od, datum.isoformat()),
+              ).fetchall()
+
+
+          def stari_nalazi(db, datum: dt.date) -> list[tuple]:
+              od = (datum - dt.timedelta(days=DANI_NALAZA)).isoformat()
+              return db.execute(
+                  "SELECT datum, lanac, naziv, marka, kolicina, poslovnica, cijena, usporedna, pad "
+                  "FROM nalazi WHERE datum>=? AND datum<? ORDER BY datum DESC, pad DESC",
+                  (od, datum.isoformat()),
+              ).fetchall()
 
 
           # --------------------------------------------------------------------------
@@ -172,6 +232,7 @@ jobs:
               naziv: str
               marka: str
               kolicina: str
+              kategorija: str
               najniza: Decimal
               poslovnica: str
               medijan: Decimal
@@ -184,8 +245,7 @@ jobs:
               """Vrati listu poslovnica (Store) za lanac, filtrirano po gradu."""
               from crawler.crawl import CRAWLERS  # iz projekta cijene-api
 
-              crawler = CRAWLERS[lanac]()
-              poslovnice = crawler.get_all_products(datum)
+              poslovnice = CRAWLERS[lanac]().get_all_products(datum)
               if grad:
                   g = bez_kvacica(grad)
                   poslovnice = [
@@ -196,7 +256,6 @@ jobs:
 
 
           def sazmi(poslovnice: list) -> dict[str, Artikl]:
-              """Za svaki artikl: najniža cijena, gdje je, i medijan preko poslovnica."""
               po_sifri: dict[str, list] = {}
               for s in poslovnice:
                   for p in s.items:
@@ -215,6 +274,7 @@ jobs:
                       naziv=p.product,
                       marka=p.brand or "",
                       kolicina=p.quantity or "",
+                      kategorija=p.category or "",
                       najniza=c,
                       poslovnica=f"{s.name}, {s.street_address}".strip(", "),
                       medijan=Decimal(str(statistics.median([u[0] for u in unosi]))),
@@ -232,15 +292,19 @@ jobs:
           @dataclass
           class Nalaz:
               lanac: str
+              sifra: str
               artikl: Artikl
               usporedna: Decimal
               pad: float
               razlog: str
 
 
-          def pronadi_sumnjive(db, datum, lanac, artikli: dict, prag: float) -> list[Nalaz]:
+          def pronadi_sumnjive(db, datum, lanac, artikli: dict, prag: float,
+                               rijeci: list[str] | None = None) -> list[Nalaz]:
               nalazi = []
               for sifra, a in artikli.items():
+                  if not odgovara_filtru(f"{a.naziv} {a.marka} {a.kategorija}", rijeci or []):
+                      continue
                   signali = []
 
                   if a.broj_poslovnica >= 3 and a.medijan >= MIN_CIJENA:
@@ -269,8 +333,8 @@ jobs:
                   if signali:
                       signali.sort(key=lambda x: -x[0])
                       pad, usporedna, _ = signali[0]
-                      razlog = " · ".join(s[2] for s in signali)
-                      nalazi.append(Nalaz(lanac, a, usporedna, pad, razlog))
+                      nalazi.append(Nalaz(lanac, sifra, a, usporedna, pad,
+                                          " · ".join(s[2] for s in signali)))
               return nalazi
 
 
@@ -278,23 +342,70 @@ jobs:
           # Izvještaj
           # --------------------------------------------------------------------------
 
-          def napravi_izvjestaj(nalazi: list[Nalaz], datum, statusi: dict, putanja: Path | None = None):
+          def graf(tocke: list[tuple[str, float]], usporedna: float) -> str:
+              """Mali SVG graf cijene kroz zadnjih 30 dana."""
+              if len(tocke) < 2:
+                  return '<span class="sitno">graf od 2. dana</span>'
+              s, v = 120, 34
+              cijene = [c for _, c in tocke] + [usporedna]
+              lo, hi = min(cijene), max(cijene)
+              raspon = (hi - lo) or 1
+              n = len(tocke) - 1
+              xy = [(i / n * (s - 4) + 2, v - 2 - (c - lo) / raspon * (v - 4)) for i, (_, c) in enumerate(tocke)]
+              linija = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
+              zx, zy = xy[-1]
+              return (f'<svg class="graf" viewBox="0 0 {s} {v}" width="{s}" height="{v}" role="img" '
+                      f'aria-label="Cijena zadnjih {len(tocke)} dana">'
+                      f'<polyline points="{linija}" fill="none" stroke="var(--mut)" stroke-width="1.5"/>'
+                      f'<circle cx="{zx:.1f}" cy="{zy:.1f}" r="3" fill="var(--hot)"/></svg>')
+
+
+          def napravi_izvjestaj(db, nalazi: list[Nalaz], datum, statusi: dict, prag, rijeci,
+                                putanja: Path | None = None):
               putanja = putanja or IZVJESTAJ
               nalazi = sorted(nalazi, key=lambda n: -n.pad)
               e = html.escape
+
               redovi = "\n".join(
                   f"""<tr>
                     <td class="pad">−{n.pad:.0f}%</td>
                     <td><b>{e(n.artikl.naziv)}</b><br><span class="sitno">{e(n.artikl.marka)} {e(n.artikl.kolicina)}</span></td>
                     <td>{e(n.lanac.title())}<br><span class="sitno">{e(n.artikl.poslovnica)}</span></td>
-                    <td class="cijena">{n.artikl.najniza:.2f} €</td>
-                    <td class="stara">{n.usporedna:.2f} €</td>
+                    <td class="cijena">{n.artikl.najniza:.2f} €<br><span class="stara">{n.usporedna:.2f} €</span></td>
+                    <td>{graf(povijest_artikla(db, datum, n.lanac, n.sifra), float(n.usporedna))}</td>
                     <td class="sitno">{e(n.razlog)}</td>
                   </tr>"""
                   for n in nalazi
               )
+
+              stari = stari_nalazi(db, datum)
+              stari_redovi = "\n".join(
+                  f"""<tr>
+                    <td class="sitno">{dt.date.fromisoformat(d):%d. %m.}</td>
+                    <td class="pad mali">−{pad:.0f}%</td>
+                    <td><b>{e(naz)}</b><br><span class="sitno">{e(mar)} {e(kol)}</span></td>
+                    <td>{e(lan.title())}<br><span class="sitno">{e(posl)}</span></td>
+                    <td class="cijena">{c:.2f} €<br><span class="stara">{u:.2f} €</span></td>
+                  </tr>"""
+                  for d, lan, naz, mar, kol, posl, c, u, pad in stari
+              )
+              stari_html = (
+                  f"""<h2>Prethodnih {DANI_NALAZA} dana</h2>
+          <div class="wrap"><table>
+          <thead><tr><th>Dan</th><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Cijena</th></tr></thead>
+          <tbody>{stari_redovi}</tbody></table></div>"""
+                  if stari else ""
+              )
+
               status_html = " · ".join(f"{e(k.title())}: {e(v)}" for k, v in statusi.items())
-              prazno = "" if nalazi else '<p class="prazno">Danas nema sumnjivih cijena. Probaj sutra ili spusti prag.</p>'
+              filtar = f" · samo: {e(', '.join(rijeci))}" if rijeci else ""
+              prazno = "" if nalazi else '<p class="prazno">Danas nema sumnjivih cijena.</p>'
+              tablica = (
+                  f"""<div class="wrap"><table>
+          <thead><tr><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Sada / inače</th><th>30 dana</th><th>Zašto je sumnjivo</th></tr></thead>
+          <tbody>{redovi}</tbody></table></div>"""
+                  if nalazi else ""
+              )
 
               sadrzaj = f"""<!doctype html>
           <html lang="hr"><head><meta charset="utf-8">
@@ -306,27 +417,62 @@ jobs:
             body {{ background:var(--bg); color:var(--tx); font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; margin:0; padding:24px 16px; }}
             main {{ max-width:1100px; margin:0 auto; }}
             h1 {{ font-size:26px; margin:0 0 4px; }}
+            h2 {{ font-size:18px; margin:36px 0 8px; }}
             .meta {{ color:var(--mut); margin-bottom:20px; }}
             table {{ width:100%; border-collapse:collapse; }}
             th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
             th {{ font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); }}
             .pad {{ color:var(--hot); font-weight:700; font-size:18px; white-space:nowrap; }}
+            .pad.mali {{ font-size:15px; }}
             .cijena {{ font-weight:700; white-space:nowrap; }}
-            .stara {{ color:var(--mut); text-decoration:line-through; white-space:nowrap; }}
+            .stara {{ color:var(--mut); font-weight:400; text-decoration:line-through; }}
             .sitno {{ color:var(--mut); font-size:13px; }}
-            .prazno {{ padding:40px 0; color:var(--mut); }}
+            .prazno {{ padding:24px 0; color:var(--mut); }}
             .wrap {{ overflow-x:auto; }}
+            .graf {{ display:block; }}
           </style></head><body><main>
           <h1>Lovac na greške</h1>
-          <div class="meta">{datum:%d. %m. %Y.} · {len(nalazi)} sumnjivih cijena · {status_html}</div>
+          <div class="meta">{datum:%d. %m. %Y.} · {len(nalazi)} sumnjivih · prag {prag:.0f}%{filtar}<br>{status_html}</div>
           {prazno}
-          <div class="wrap"><table>
-          <thead><tr><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Sada</th><th>Inače</th><th>Zašto je sumnjivo</th></tr></thead>
-          <tbody>{redovi}</tbody></table></div>
-          <p class="sitno">Prije puta u dućan provjeri cijenu na polici: neki "padovi" su samo krivo objavljen cjenik ili artikl koji je nestao s police.</p>
+          {tablica}
+          {stari_html}
+          <p class="sitno" style="margin-top:28px">Prije puta u dućan provjeri cijenu na polici: neki "padovi" su krivo objavljen cjenik ili artikl koji nije na polici.</p>
           </main></body></html>"""
               putanja.write_text(sadrzaj, encoding="utf-8")
               return putanja
+
+
+          # --------------------------------------------------------------------------
+          # Telegram
+          # --------------------------------------------------------------------------
+
+          def posalji_telegram(nalazi: list[Nalaz], datum) -> None:
+              token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+              chat = os.environ.get("TELEGRAM_CHAT", "").strip()
+              if not token or not chat or not nalazi:
+                  return
+              nalazi = sorted(nalazi, key=lambda n: -n.pad)[:10]
+              redovi = [f"🔎 Lovac na greške, {datum:%d. %m.}: {len(nalazi)} sumnjivih"]
+              for n in nalazi:
+                  redovi.append(
+                      f"\n−{n.pad:.0f}%  {n.artikl.naziv} {n.artikl.kolicina}".rstrip()
+                      + f"\n{n.artikl.najniza:.2f} € (inače {n.usporedna:.2f} €)"
+                      + f"\n{n.artikl.poslovnica}"
+                  )
+              url_stranice = os.environ.get("STRANICA_URL", "").strip()
+              if url_stranice:
+                  redovi.append(f"\n{url_stranice}")
+              podaci = urllib.parse.urlencode({
+                  "chat_id": chat, "text": "\n".join(redovi), "disable_web_page_preview": "true",
+              }).encode()
+              try:
+                  with urllib.request.urlopen(
+                      f"https://api.telegram.org/bot{token}/sendMessage", data=podaci, timeout=20
+                  ) as r:
+                      ok = json.loads(r.read().decode()).get("ok")
+                  print("Telegram: poslano" if ok else "Telegram: nije poslano")
+              except Exception as err:
+                  print(f"Telegram: nije poslano ({err})")
 
 
           # --------------------------------------------------------------------------
@@ -335,19 +481,18 @@ jobs:
 
           def main(argv=None):
               ap = argparse.ArgumentParser(description="Lovac na greške u cijenama hrane")
-              ap.add_argument("-c", "--lanci", default=",".join(ZADANI_LANCI),
-                              help="lanci odvojeni zarezom (npr. kaufland,plodine,konzum,spar)")
-              ap.add_argument("--grad", default=ZADANI_GRAD,
-                              help='samo poslovnice u ovom gradu; "" za cijelu Hrvatsku')
-              ap.add_argument("--prag", type=float, default=ZADANI_PRAG,
-                              help="postotak pada koji je sumnjiv (zadano 50)")
-              ap.add_argument("-d", "--datum", default=None, help="datum YYYY-MM-DD (zadano danas)")
-              ap.add_argument("--ne-otvaraj", action="store_true", help="ne otvaraj izvještaj u pregledniku")
+              ap.add_argument("-c", "--lanci", default=ZADANI_LANCI)
+              ap.add_argument("--grad", default=ZADANI_GRAD)
+              ap.add_argument("--prag", type=float, default=ZADANI_PRAG)
+              ap.add_argument("--samo", default="", help='npr. "kava,meso,protein"')
+              ap.add_argument("-d", "--datum", default=None, help="YYYY-MM-DD (zadano danas)")
+              ap.add_argument("--ne-otvaraj", action="store_true")
               args = ap.parse_args(argv)
 
               logging.basicConfig(level=logging.WARNING, format="%(message)s")
               datum = dt.date.fromisoformat(args.datum) if args.datum else dt.date.today()
               lanci = [l.strip().lower() for l in args.lanci.split(",") if l.strip()]
+              rijeci = [bez_kvacica(r.strip()) for r in args.samo.split(",") if r.strip()]
 
               db = otvori_bazu()
               svi_nalazi, statusi = [], {}
@@ -356,7 +501,7 @@ jobs:
                   print(f"→ {lanac.title()}: skidam cjenike...", flush=True)
                   try:
                       poslovnice = prikupi(lanac, datum, args.grad)
-                  except Exception as err:  # mreža, promjena formata, nema cjenika za danas
+                  except Exception as err:
                       print(f"  ✗ nije uspjelo: {err}")
                       statusi[lanac] = "nije uspjelo"
                       continue
@@ -366,14 +511,16 @@ jobs:
                       continue
 
                   artikli = sazmi(poslovnice)
-                  nalazi = pronadi_sumnjive(db, datum, lanac, artikli, args.prag)
+                  nalazi = pronadi_sumnjive(db, datum, lanac, artikli, args.prag, rijeci)
                   spremi_dan(db, datum, lanac, artikli)
+                  spremi_nalaze(db, datum, lanac, nalazi)
                   svi_nalazi += nalazi
                   statusi[lanac] = f"{len(poslovnice)} poslovnica, {len(artikli)} artikala"
                   print(f"  ✓ {len(poslovnice)} poslovnica, {len(artikli)} artikala, {len(nalazi)} sumnjivih")
 
-              putanja = napravi_izvjestaj(svi_nalazi, datum, statusi)
+              putanja = napravi_izvjestaj(db, svi_nalazi, datum, statusi, args.prag, rijeci)
               print(f"\nIzvještaj: {putanja}")
+              posalji_telegram(svi_nalazi, datum)
               if not args.ne_otvaraj:
                   webbrowser.open(putanja.as_uri())
 
@@ -382,7 +529,7 @@ jobs:
               sys.exit(main())
           LOVAC_EOF
           uv sync
-          uv run lovac.py --ne-otvaraj -c kaufland,plodine
+          uv run lovac.py --ne-otvaraj -c "$LANCI" --grad "$GRAD" --prag "$PRAG" --samo "$SAMO"
           mkdir -p ../stranica
           cp izvjestaj.html ../stranica/index.html
 
