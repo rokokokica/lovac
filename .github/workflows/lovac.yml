@@ -339,7 +339,13 @@ jobs:
                   if signali:
                       signali.sort(key=lambda x: -x[0])
                       pad, usporedna, _ = signali[0]
-                      jaki = any(not s[2].startswith("SIDRENA") for s in signali)
+                      # Greška = jeftinije nego u drugim poslovnicama ili nagli pad u odnosu na povijest.
+                      # Pad ispod najniže cijene u 30 dana računa se kao greška samo ako nije službena akcija.
+                      jaki = any(
+                          s[2].startswith(("POSLOVNICA", "POVIJEST"))
+                          or (s[2].startswith("30 DANA") and not a.akcijska)
+                          for s in signali
+                      )
                       nalazi.append(Nalaz(lanac, sifra, a, usporedna, pad,
                                           " · ".join(s[2] for s in signali), jaki))
               return nalazi
@@ -396,11 +402,11 @@ jobs:
                   for n in rasprodaje[:MAX_RASPRODAJA]
               )
               ras_html = (
-                  f"""<details><summary><h2>Rasprodaje ({len(rasprodaje)})</h2></summary>
-          <p class="sitno">Artikli daleko ispod sidrene cijene iz svibnja 2025. To najčešće nisu greške nego sezonske rasprodaje,
+                  f"""<details><summary><h2>Rasprodaje i velike akcije ({len(rasprodaje)})</h2></summary>
+          <p class="sitno">Artikli daleko ispod sidrene cijene iz svibnja 2025. ili službene akcije s ogromnim popustom. To nisu greške,
           ali znaju biti jako isplative. Prikazano je {min(len(rasprodaje), MAX_RASPRODAJA)} najvećih.</p>
           <div class="wrap"><table>
-          <thead><tr><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Sada / sidrena</th></tr></thead>
+          <thead><tr><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Sada / inače</th></tr></thead>
           <tbody>{ras_redovi}</tbody></table></div></details>"""
                   if rasprodaje else ""
               )
@@ -462,7 +468,7 @@ jobs:
             summary h2 {{ display:inline; margin:0; color:var(--tx); }}
           </style></head><body><main>
           <h1>Lovac na greške</h1>
-          <div class="meta">{datum:%d. %m. %Y.} · {len(nalazi)} mogućih grešaka · {len(rasprodaje)} rasprodaja · prag {prag:.0f}%{filtar}<br>{status_html}</div>
+          <div class="meta">{datum:%d. %m. %Y.} · {len(nalazi)} mogućih grešaka · {len(rasprodaje)} rasprodaja i akcija · prag {prag:.0f}%{filtar}<br>{status_html}</div>
           {prazno}
           {tablica}
           {stari_html}
