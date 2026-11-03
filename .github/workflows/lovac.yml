@@ -106,6 +106,7 @@ jobs:
           MIN_CIJENA = Decimal("1.00")  # ispod ovoga ne gledamo
           DANI_POVIJESTI = 30
           DANI_NALAZA = 7  # koliko dana unatrag prikazati stare nalaze
+          MAX_RASPRODAJA = 40  # koliko rasprodaja prikazati
 
           log = logging.getLogger("lovac")
 
@@ -188,7 +189,7 @@ jobs:
                       (datum.isoformat(), n.lanac, n.sifra, n.artikl.naziv, n.artikl.marka,
                        n.artikl.kolicina, n.artikl.poslovnica, float(n.artikl.najniza),
                        float(n.usporedna), n.pad, n.razlog)
-                      for n in nalazi
+                      for n in nalazi if n.jaki
                   ],
               )
               granica = (datum - dt.timedelta(days=DANI_POVIJESTI + 5)).isoformat()
@@ -301,6 +302,7 @@ jobs:
               usporedna: Decimal
               pad: float
               razlog: str
+              jaki: bool = True  # False = samo ispod sidrene cijene (vjerojatno rasprodaja)
 
 
           def pronadi_sumnjive(db, datum, lanac, artikli: dict, prag: float,
@@ -337,8 +339,9 @@ jobs:
                   if signali:
                       signali.sort(key=lambda x: -x[0])
                       pad, usporedna, _ = signali[0]
+                      jaki = any(not s[2].startswith("SIDRENA") for s in signali)
                       nalazi.append(Nalaz(lanac, sifra, a, usporedna, pad,
-                                          " · ".join(s[2] for s in signali)))
+                                          " · ".join(s[2] for s in signali), jaki))
               return nalazi
 
 
@@ -367,7 +370,8 @@ jobs:
           def napravi_izvjestaj(db, nalazi: list[Nalaz], datum, statusi: dict, prag, rijeci,
                                 putanja: Path | None = None):
               putanja = putanja or IZVJESTAJ
-              nalazi = sorted(nalazi, key=lambda n: -n.pad)
+              rasprodaje = sorted([n for n in nalazi if not n.jaki], key=lambda n: -n.pad)
+              nalazi = sorted([n for n in nalazi if n.jaki], key=lambda n: -n.pad)
               e = html.escape
 
               redovi = "\n".join(
@@ -380,6 +384,25 @@ jobs:
                     <td class="sitno">{e(n.razlog)}</td>
                   </tr>"""
                   for n in nalazi
+              )
+
+              ras_redovi = "\n".join(
+                  f"""<tr>
+                    <td class="pad mali">−{n.pad:.0f}%</td>
+                    <td><b>{e(n.artikl.naziv)}</b><br><span class="sitno">{e(n.artikl.marka)} {e(n.artikl.kolicina)}</span></td>
+                    <td>{e(n.lanac.title())}<br><span class="sitno">{e(n.artikl.poslovnica)}</span></td>
+                    <td class="cijena">{n.artikl.najniza:.2f} €<br><span class="stara">{n.usporedna:.2f} €</span></td>
+                  </tr>"""
+                  for n in rasprodaje[:MAX_RASPRODAJA]
+              )
+              ras_html = (
+                  f"""<details><summary><h2>Rasprodaje ({len(rasprodaje)})</h2></summary>
+          <p class="sitno">Artikli daleko ispod sidrene cijene iz svibnja 2025. To najčešće nisu greške nego sezonske rasprodaje,
+          ali znaju biti jako isplative. Prikazano je {min(len(rasprodaje), MAX_RASPRODAJA)} najvećih.</p>
+          <div class="wrap"><table>
+          <thead><tr><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Sada / sidrena</th></tr></thead>
+          <tbody>{ras_redovi}</tbody></table></div></details>"""
+                  if rasprodaje else ""
               )
 
               stari = stari_nalazi(db, datum)
@@ -403,7 +426,7 @@ jobs:
 
               status_html = " · ".join(f"{e(k.title())}: {e(v)}" for k, v in statusi.items())
               filtar = f" · samo: {e(', '.join(rijeci))}" if rijeci else ""
-              prazno = "" if nalazi else '<p class="prazno">Danas nema sumnjivih cijena.</p>'
+              prazno = "" if nalazi else '<p class="prazno">Danas nema mogućih grešaka u cijenama.</p>'
               tablica = (
                   f"""<div class="wrap"><table>
           <thead><tr><th>Pad</th><th>Artikl</th><th>Gdje</th><th>Sada / inače</th><th>30 dana</th><th>Zašto je sumnjivo</th></tr></thead>
@@ -434,12 +457,16 @@ jobs:
             .prazno {{ padding:24px 0; color:var(--mut); }}
             .wrap {{ overflow-x:auto; }}
             .graf {{ display:block; }}
+            details {{ margin-top:36px; }}
+            summary {{ cursor:pointer; color:var(--mut); }}
+            summary h2 {{ display:inline; margin:0; color:var(--tx); }}
           </style></head><body><main>
           <h1>Lovac na greške</h1>
-          <div class="meta">{datum:%d. %m. %Y.} · {len(nalazi)} sumnjivih · prag {prag:.0f}%{filtar}<br>{status_html}</div>
+          <div class="meta">{datum:%d. %m. %Y.} · {len(nalazi)} mogućih grešaka · {len(rasprodaje)} rasprodaja · prag {prag:.0f}%{filtar}<br>{status_html}</div>
           {prazno}
           {tablica}
           {stari_html}
+          {ras_html}
           <p class="sitno" style="margin-top:28px">Prije puta u dućan provjeri cijenu na polici: neki "padovi" su krivo objavljen cjenik ili artikl koji nije na polici.</p>
           </main></body></html>"""
               putanja.write_text(sadrzaj, encoding="utf-8")
@@ -453,10 +480,12 @@ jobs:
           def posalji_telegram(nalazi: list[Nalaz], datum) -> None:
               token = os.environ.get("TELEGRAM_TOKEN", "").strip()
               chat = os.environ.get("TELEGRAM_CHAT", "").strip()
+              nalazi = [n for n in nalazi if n.jaki]
               if not token or not chat or not nalazi:
                   return
+              ukupno = len(nalazi)
               nalazi = sorted(nalazi, key=lambda n: -n.pad)[:10]
-              redovi = [f"🔎 Lovac na greške, {datum:%d. %m.}: {len(nalazi)} sumnjivih"]
+              redovi = [f"🔎 Lovac na greške, {datum:%d. %m.}: {ukupno} mogućih grešaka"]
               for n in nalazi:
                   redovi.append(
                       f"\n−{n.pad:.0f}%  {n.artikl.naziv} {n.artikl.kolicina}".rstrip()
@@ -487,7 +516,7 @@ jobs:
                   for dio in n.razlog.split(" · "):
                       brojac[dio.split(":")[0]] += 1
               print("    signali:", dict(brojac))
-              for n in sorted(nalazi, key=lambda n: -n.pad)[:12]:
+              for n in sorted([n for n in nalazi if n.jaki], key=lambda n: -n.pad)[:12]:
                   a = n.artikl
                   print(f"    DIAG −{n.pad:.0f}% | {a.naziv[:40]} | {a.kolicina} | sada {a.najniza} | "
                         f"medijan {a.medijan} ({a.broj_poslovnica} posl.) | sidrena {a.sidrena} | "
@@ -535,7 +564,9 @@ jobs:
                   spremi_nalaze(db, datum, lanac, nalazi)
                   svi_nalazi += nalazi
                   statusi[lanac] = f"{len(poslovnice)} poslovnica, {len(artikli)} artikala"
-                  print(f"  ✓ {len(poslovnice)} poslovnica, {len(artikli)} artikala, {len(nalazi)} sumnjivih")
+                  jaki = sum(n.jaki for n in nalazi)
+                  print(f"  ✓ {len(poslovnice)} poslovnica, {len(artikli)} artikala, "
+                        f"{jaki} mogućih grešaka, {len(nalazi) - jaki} rasprodaja")
                   dijagnostika(nalazi)
 
               putanja = napravi_izvjestaj(db, svi_nalazi, datum, statusi, args.prag, rijeci)
